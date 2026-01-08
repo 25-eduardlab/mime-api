@@ -6,8 +6,11 @@ import rateLimit from "express-rate-limit";
 import { pool } from "./src/db.js";
 import { contactSchema } from "./src/validate.js";
 import { requireBasicAuth } from "./src/basicAuth.js";
+import { sendLeadEmail } from "./src/mailer.js";
 
 const app = express();
+app.set("trust proxy", 1);
+
 
 app.use(helmet());
 app.use(express.json({ limit: "200kb" }));
@@ -24,10 +27,13 @@ app.use("/api/contact", rateLimit({ windowMs: 60_000, max: 10 }));
 app.post("/api/contact", async (req, res) => {
   const parsed = contactSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+    return res.status(400).json({
+      error: "Datos inválidos",
+      details: parsed.error.flatten(),
+    });
   }
-  const data = parsed.data;
 
+  const data = parsed.data;
   if (!data.acepta) return res.status(400).json({ error: "Debe aceptar términos" });
 
   const ip =
@@ -38,6 +44,7 @@ app.post("/api/contact", async (req, res) => {
   const ua = req.headers["user-agent"] || null;
 
   try {
+    // 1) Guardar en BD
     await pool.query(
       `INSERT INTO contacts
         (nombre, apellido, email, telefono, empresa, cargo, mensaje, ip, user_agent)
@@ -55,7 +62,16 @@ app.post("/api/contact", async (req, res) => {
       ]
     );
 
-    return res.status(200).json({ ok: true });
+    // 2) Enviar correo (si falla, NO rompe)
+    let emailSent = false;
+    try {
+      await sendLeadEmail(data);
+      emailSent = true;
+    } catch (e) {
+      console.error("Email error:", e);
+    }
+
+    return res.status(200).json({ ok: true, emailSent });
   } catch (e) {
     console.error("DB error:", e);
     return res.status(500).json({ error: "Error guardando en BD" });
@@ -75,6 +91,7 @@ app.get("/api/admin/contacts", requireBasicAuth, async (req, res) => {
        LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
+
     res.json({ ok: true, items: rows, limit, offset });
   } catch (e) {
     console.error("DB error:", e);
